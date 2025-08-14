@@ -1,6 +1,6 @@
 """
-Combined Ultimate Website Analyzer API v4.0
-Combines both short structured output AND comprehensive detailed output
+Combined Ultimate Website Analyzer API v4.1
+Combines structured + detailed analysis + REAL Google Core Web Vitals
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -10,10 +10,12 @@ from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List, Dict, Any, Union
 import asyncio
 import aiohttp
+import httpx
 import time
 import os
 import logging
 from datetime import datetime
+from cachetools import TTLCache
 import json
 import re
 from urllib.parse import urljoin, urlparse
@@ -36,13 +38,24 @@ logger = logging.getLogger(__name__)
 
 # Environment variables
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-API_VERSION = os.getenv("API_VERSION", "4.0.0")
+API_VERSION = os.getenv("API_VERSION", "4.1.0")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "300"))
 
+# Google API Keys for real Core Web Vitals
+PSI_KEY = os.getenv("PSI_API_KEY")  # PageSpeed Insights API Key
+CRUX_KEY = os.getenv("CRUX_API_KEY")  # Chrome UX Report API Key
+
+# Google API URLs
+PSI_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+CRUX_URL = "https://chromeuxreport.googleapis.com/v1/records:query"
+
+# Cache for Google API results (12 hours TTL)
+VITALS_CACHE = TTLCache(maxsize=1000, ttl=60*60*12)
+
 app = FastAPI(
     title="Combined Ultimate Website Analyzer API",
-    description="Complete website analysis with both structured metrics AND detailed content analysis",
+    description="Complete website analysis with both structured metrics AND detailed content analysis + REAL Google Core Web Vitals",
     version=API_VERSION,
     docs_url="/docs" if ENVIRONMENT != "production" else None,
     redoc_url="/redoc" if ENVIRONMENT != "production" else None
@@ -98,6 +111,7 @@ class CombinedAnalyzeRequest(BaseModel):
     mode: ScanMode = ScanMode.comprehensive
     device: Device = Device.desktop
     include_performance: bool = True
+    include_real_vitals: bool = True  # NEW: Real Google Core Web Vitals
     include_seo: bool = True
     include_security: bool = True
     include_content: bool = True
@@ -108,6 +122,238 @@ class CombinedAnalyzeRequest(BaseModel):
     include_accessibility: bool = True
     include_mobile: bool = True
     include_external_resources: bool = True
+    use_origin_fallback: bool = True  # NEW: For CrUX data fallback
+
+# =====================
+# GOOGLE API UTILITIES
+# =====================
+
+def ms_to_s(v: Optional[float]) -> Optional[float]:
+    """Convert milliseconds to seconds with 3 decimal precision"""
+    return round(v/1000.0, 3) if isinstance(v, (int, float)) else None
+
+def get_rating(metric: str, value: Optional[float]) -> Optional[str]:
+    """Get rating label for Core Web Vitals metrics"""
+    if value is None: 
+        return None
+    
+    thresholds = {
+        "LCP": (2.5, 4.0),      # good <= 2.5s, poor > 4.0s
+        "INP": (0.2, 0.5),      # good <= 200ms, poor > 500ms
+        "CLS": (0.1, 0.25),     # good <= 0.1, poor > 0.25
+        "FID": (0.1, 0.3)       # good <= 100ms, poor > 300ms
+    }
+    
+    if metric not in thresholds:
+        return None
+        
+    good_threshold, poor_threshold = thresholds[metric]
+    
+    if value <= good_threshold:
+        return "good"
+    elif value <= poor_threshold:
+        return "needs_improvement"
+    else:
+        return "poor"
+
+async def get_crux_data(url: str, form_factor: str = "PHONE", use_origin_fallback: bool = True) -> Dict[str, Any]:
+    """
+    Get real CrUX field data for the given URL
+    """
+    if not CRUX_KEY:
+        return {"available": False, "reason": "CRUX_API_KEY not configured"}
+
+    # First attempt: exact URL (page-level data)
+    payload = {
+        "url": url,
+        "formFactor": form_factor
+    }
+    headers = {"Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.post(
+                f"{CRUX_URL}?key={CRUX_KEY}", 
+                json=payload, 
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                metrics = data.get("record", {}).get("metrics", {})
+                if metrics:
+                    return await parse_crux_metrics(metrics, "page")
+        except Exception as e:
+            logger.warning(f"CrUX page-level error: {e}")
+
+        # Fallback to origin-level data
+        if use_origin_fallback:
+            try:
+                # Extract origin from URL
+                parsed = urlparse(url)
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+                
+                origin_payload = {
+                    "origin": origin,
+                    "formFactor": form_factor
+                }
+                
+                response = await client.post(
+                    f"{CRUX_URL}?key={CRUX_KEY}", 
+                    json=origin_payload, 
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    metrics = data.get("record", {}).get("metrics", {})
+                    if metrics:
+                        return await parse_crux_metrics(metrics, "origin")
+            except Exception as e:
+                logger.warning(f"CrUX origin-level error: {e}")
+
+    return {"available": False, "reason": "No CrUX data available"}
+
+async def parse_crux_metrics(metrics: Dict, source: str) -> Dict[str, Any]:
+    """Parse CrUX metrics and convert to seconds where needed"""
+    
+    def get_p75(metric_key: str, convert_to_seconds: bool = True) -> Optional[float]:
+        try:
+            value = metrics.get(metric_key, {}).get("percentiles", {}).get("p75")
+            if value is None:
+                return None
+            return ms_to_s(value) if convert_to_seconds else value
+        except:
+            return None
+
+    return {
+        "available": True,
+        "source": source,
+        "LCP_s": get_p75("largest_contentful_paint", True),
+        "INP_s": get_p75("interaction_to_next_paint", True),
+        "CLS": get_p75("cumulative_layout_shift", False),
+        "FID_s": get_p75("first_input_delay", True)  # Legacy metric
+    }
+
+async def get_psi_data(url: str, strategy: str = "mobile") -> Dict[str, Any]:
+    """
+    Get real PageSpeed Insights (Lighthouse) lab data
+    """
+    if not PSI_KEY:
+        return {"available": False, "reason": "PSI_API_KEY not configured"}
+
+    params = {
+        "url": url,
+        "strategy": strategy,
+        "category": "performance",
+        "key": PSI_KEY
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        try:
+            response = await client.get(PSI_URL, params=params)
+            
+            if response.status_code != 200:
+                return {
+                    "available": False, 
+                    "reason": f"PSI API error: {response.status_code}",
+                    "details": response.text[:200]
+                }
+            
+            data = response.json()
+            lighthouse_result = data.get("lighthouseResult", {})
+            audits = lighthouse_result.get("audits", {})
+            
+            # Performance score
+            perf_score = lighthouse_result.get("categories", {}).get("performance", {}).get("score")
+            if isinstance(perf_score, (int, float)):
+                perf_score = round(perf_score * 100)
+
+            # Core Web Vitals
+            lcp_audit = audits.get("largest-contentful-paint", {})
+            cls_audit = audits.get("cumulative-layout-shift", {})
+            inp_audit = audits.get("interaction-to-next-paint", {})
+            
+            return {
+                "available": True,
+                "LCP_s": ms_to_s(lcp_audit.get("numericValue")),
+                "CLS": cls_audit.get("numericValue"),
+                "INP_s": ms_to_s(inp_audit.get("numericValue")),
+                "performance_score": perf_score,
+                "loading_experience": data.get("loadingExperience", {}).get("overall_category"),
+                "origin_fallback": data.get("originFallback", False)
+            }
+            
+        except Exception as e:
+            logger.warning(f"PSI request failed: {str(e)}")
+            return {"available": False, "reason": f"PSI request failed: {str(e)}"}
+
+def merge_field_and_lab_data(field_data: Dict[str, Any], lab_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combine field data (CrUX) and lab data (PSI) with field data priority
+    """
+    # Use field data as primary, lab data as fallback
+    lcp = field_data.get("LCP_s") if field_data.get("LCP_s") is not None else lab_data.get("LCP_s")
+    inp = field_data.get("INP_s") if field_data.get("INP_s") is not None else lab_data.get("INP_s")
+    cls = field_data.get("CLS") if field_data.get("CLS") is not None else lab_data.get("CLS")
+    
+    return {
+        "LCP_s": lcp,
+        "INP_s": inp,
+        "CLS": cls,
+        "FID_s": field_data.get("FID_s"),  # Only from CrUX
+        "ratings": {
+            "LCP": get_rating("LCP", lcp),
+            "INP": get_rating("INP", inp),
+            "CLS": get_rating("CLS", cls)
+        }
+    }
+
+async def get_real_core_web_vitals(url: str, device: str = "mobile", use_origin_fallback: bool = True) -> Dict[str, Any]:
+    """
+    Get REAL Core Web Vitals from Google APIs
+    """
+    # Cache check
+    cache_key = (url, device)
+    if cache_key in VITALS_CACHE:
+        cached_result = VITALS_CACHE[cache_key].copy()
+        cached_result["from_cache"] = True
+        return cached_result
+
+    # Determine parameters
+    form_factor = "PHONE" if device.lower() == "mobile" else "DESKTOP"
+    strategy = "mobile" if device.lower() == "mobile" else "desktop"
+    
+    # Get data (parallel)
+    field_data, lab_data = await asyncio.gather(
+        get_crux_data(url, form_factor, use_origin_fallback),
+        get_psi_data(url, strategy)
+    )
+    
+    # Combine results
+    combined_metrics = merge_field_and_lab_data(field_data, lab_data)
+    
+    result = {
+        "url": url,
+        "device": device,
+        "timestamp": int(time.time()),
+        "field_data": {
+            "available": field_data.get("available", False),
+            "source": field_data.get("source"),
+            "reason": field_data.get("reason") if not field_data.get("available") else None
+        },
+        "lab_data": {
+            "available": lab_data.get("available", False),
+            "performance_score": lab_data.get("performance_score"),
+            "reason": lab_data.get("reason") if not lab_data.get("available") else None
+        },
+        "metrics": combined_metrics,
+        "from_cache": False
+    }
+    
+    # Cache the result
+    VITALS_CACHE[cache_key] = result
+    return result
 
 # =====================
 # BROWSER MANAGER
@@ -1816,12 +2062,15 @@ async def shutdown_event():
 if __name__ == "__main__":
     import uvicorn
     
+    # Get port from environment (Render uses dynamic ports)
+    port = int(os.getenv("PORT", 8000))
+    
     # Production settings
     if ENVIRONMENT == "production":
         uvicorn.run(
             "main:app",
             host="0.0.0.0",
-            port=int(os.getenv("PORT", 8000)),
+            port=port,
             workers=MAX_WORKERS,
             access_log=False,
             log_level="info"
@@ -1831,7 +2080,7 @@ if __name__ == "__main__":
         uvicorn.run(
             app,
             host="0.0.0.0",
-            port=8000,
+            port=port,
             reload=True,
             log_level="debug"
         )
