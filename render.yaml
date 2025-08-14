@@ -15,13 +15,18 @@ services:
       - key: ENVIRONMENT
         value: production
       - key: API_VERSION
-        value: "4.0.0"
+        value: "4.1.0"
       - key: MAX_WORKERS
         value: "1"
       - key: TIMEOUT_SECONDS
         value: "300"
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /ms-playwright
+      # Google API Keys - ADD THESE VIA RENDER DASHBOARD (NOT HERE!)
+      # - key: PSI_API_KEY
+      #   value: YOUR_PAGESPEED_INSIGHTS_API_KEY
+      # - key: CRUX_API_KEY  
+      #   value: YOUR_CHROME_UX_REPORT_API_KEY
     
     # Health check endpoint
     healthCheckPath: /health
