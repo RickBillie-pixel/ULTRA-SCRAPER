@@ -1,0 +1,54 @@
+services:
+  - type: web
+    name: website-analyzer-api
+    runtime: docker
+    plan: starter  # Can be: starter, standard, pro
+    region: oregon  # or: frankfurt, singapore, ohio
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./
+    
+    # Environment variables
+    envVars:
+      - key: PYTHONPATH
+        value: /app
+      - key: ENVIRONMENT
+        value: production
+      - key: API_VERSION
+        value: "2.0.0"
+      - key: MAX_WORKERS
+        value: "1"
+      - key: TIMEOUT_SECONDS
+        value: "300"
+    
+    # Health check endpoint
+    healthCheckPath: /
+    
+    # Auto-deploy settings
+    autoDeploy: true
+    
+    # Resource limits for different plans
+    # Starter: 0.5 CPU, 512 MB RAM
+    # Standard: 1 CPU, 2 GB RAM  
+    # Pro: 2 CPU, 4 GB RAM
+    
+    # Scaling settings (for paid plans)
+    # numInstances: 1
+    # scaling:
+    #   minInstances: 1
+    #   maxInstances: 3
+    #   targetMemoryPercent: 80
+    #   targetCPUPercent: 80
+
+# Optional: Add a Redis cache for caching analysis results
+# - type: redis
+#   name: analyzer-cache
+#   plan: starter
+#   maxmemoryPolicy: allkeys-lru
+
+# Optional: Add a PostgreSQL database for storing analysis history
+# - type: pserv
+#   name: analyzer-db
+#   plan: starter
+#   databaseName: website_analyzer
+#   databaseUser: analyzer_user
